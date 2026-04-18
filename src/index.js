@@ -107,10 +107,17 @@ export default {
 async function runHourly(env) {
   console.log('[runHourly] bắt đầu', new Date().toISOString());
   try {
-    await syncPrices(env);
+    const syncResult = await syncPrices(env);
     await checkThresholdsAndAlert(env);
   } catch (e) {
     console.error('[runHourly] lỗi:', e.message);
+    // Gửi cảnh báo Telegram nếu có lỗi
+    await sendTelegramMessage(env, env.TELEGRAM_CHAT_ID,
+      `⚠️ *Lỗi đồng bộ Portfolio*\n` +
+      `_${escMd(fmtTime(new Date()))}_\n\n` +
+      `Error: \`${escMd(e.message)}\`\n\n` +
+      `_/sync để thử lại_`
+    );
   }
 }
 
@@ -133,21 +140,34 @@ async function syncPrices(env) {
   const [usdVnd, eurVnd] = await Promise.all([getFxRate('USD'), getFxRate('EUR')]);
   console.log(`[syncPrices] tỷ giá USD/VND: ${usdVnd}, EUR/VND: ${eurVnd}`);
 
-  // Thu thập tickers crypto cần lấy giá
-  const cryptoTickers = [];
+  // Thu thập tickers theo loại source
+  const binanceTickers = [];
+  const coingeckoTickers = [];
   rows.forEach(row => {
     const status = row[COL.STATUS - 1] || '';
     const source = row[COL.SOURCE - 1] || '';
     const ticker = (row[COL.TICKER - 1] || '').toUpperCase();
-    if (status === 'ACTIVE' && ['BINANCE', 'COINGECKO'].includes(source) && CG_ID[ticker]) {
-      cryptoTickers.push(ticker);
+    if (status === 'ACTIVE' && CG_ID[ticker]) {
+      if (source === 'BINANCE') {
+        binanceTickers.push(ticker);
+      } else if (source === 'COINGECKO') {
+        coingeckoTickers.push(ticker);
+      }
     }
   });
 
-  // Lấy giá batch từ CoinGecko (1 request cho tất cả)
-  const cryptoPrices = cryptoTickers.length > 0
-    ? await getCoinGeckoPrices([...new Set(cryptoTickers)], env)
+  // Lấy giá từ Binance (bao gồm balances)
+  const binanceData = binanceTickers.length > 0
+    ? await getBinanceBalances(env)
+    : { balances: {}, prices: {} };
+
+  // Lấy giá từ CoinGecko (chỉ giá)
+  const coingeckoPrices = coingeckoTickers.length > 0
+    ? await getCoinGeckoPrices([...new Set(coingeckoTickers)], env)
     : {};
+
+  // Merge giá: Binance prices + CoinGecko prices
+  const allPrices = { ...coingeckoPrices, ...binanceData.prices };
 
   // Chuẩn bị batch update cho Sheets
   const batchUpdates = [];
@@ -160,15 +180,31 @@ async function syncPrices(env) {
     const source   = row[COL.SOURCE - 1] || '';
     const ticker   = (row[COL.TICKER - 1] || '').toUpperCase();
     const currency = row[COL.CURRENCY - 1] || 'VND';
-    const qty      = parseFloat(row[COL.QTY - 1]) || 0;
+    const oldQty   = parseFloat(row[COL.QTY - 1]) || 0;
 
     if (status !== 'ACTIVE') return;
 
     let newPrice = null;
+    let newQty = oldQty;
     const fxRate = currency === 'USD' ? usdVnd : currency === 'EUR' ? eurVnd : 1;
 
-    if (['BINANCE', 'COINGECKO'].includes(source)) {
-      newPrice = cryptoPrices[ticker] ?? null;
+    // Lấy giá từ nguồn tương ứng
+    if (source === 'BINANCE') {
+      newPrice = binanceData.prices[ticker] ?? null;
+      // Cập nhật số dư từ Binance
+      const binanceQty = binanceData.balances[ticker];
+      if (binanceQty !== undefined) {
+        newQty = binanceQty;
+        // Cập nhật cột QTY (I) nếu số dư thay đổi
+        if (Math.abs(newQty - oldQty) > 0.00000001) {
+          batchUpdates.push({
+            range: `${SHEET.ASSETS}!I${rowNum}`,
+            values: [[newQty]],
+          });
+        }
+      }
+    } else if (source === 'COINGECKO') {
+      newPrice = allPrices[ticker] ?? null;
     }
     // GOOGLEFINANCE và MANUAL: giá tự cập nhật trong Sheets hoặc nhập tay
 
@@ -190,16 +226,16 @@ async function syncPrices(env) {
 
     // Ghi lịch sử
     const price = newPrice ?? parseFloat(row[COL.CURRENT_PRICE - 1]) || 0;
-    if (price > 0 && qty > 0) {
+    if (price > 0 && newQty > 0) {
       historyRows.push([now, ticker, row[1] || '', row[COL.GROUP - 1] || '',
-        price, currency, fxRate, qty * price * fxRate]);
+        price, currency, fxRate, newQty * price * fxRate]);
     }
   });
 
   // Batch write vào Sheets
   if (batchUpdates.length > 0) {
     await sheets.batchUpdate(batchUpdates);
-    console.log(`[syncPrices] cập nhật ${batchUpdates.length} ô`);
+    console.log(`[syncPrices] cập nhật ${batchUpdates.length} ô (Binance: ${Object.keys(binanceData.balances).length}, CoinGecko: ${coingeckoTickers.length})`);
   }
 
   // Ghi lịch sử giá
@@ -297,9 +333,14 @@ async function handleTelegramWebhook(request, env) {
       break;
 
     case text === '/sync':
-      await sendTelegramMessage(env, chatId, '🔄 Đang đồng bộ giá\\.\\.\\.');
-      await syncPrices(env);
-      await sendTelegramMessage(env, chatId, '✅ Đồng bộ hoàn tất\\!');
+      await sendTelegramMessage(env, chatId, '🔄 Đang đồng bộ giá Binance & CoinGecko\\.\\.\\.');
+      try {
+        await syncPrices(env);
+        await sendTelegramMessage(env, chatId, '✅ Đồng bộ hoàn tất\\! (Binance balances, CoinGecko prices)');
+      } catch (e) {
+        await sendTelegramMessage(env, chatId, 
+          `❌ Lỗi đồng bộ\\: \`${escMd(e.message)}\`\n_Kiểm tra logs_`);
+      }
       break;
 
     case text === '/top':
@@ -439,6 +480,94 @@ async function getFxRate(baseCurrency) {
   } catch {
     return FALLBACK[baseCurrency] ?? 1;
   }
+}
+
+// ════════════════════════════════════════════════════════════
+//  API: BINANCE (lấy số dư và giá từ Binance Spot API)
+// ════════════════════════════════════════════════════════════
+async function getBinanceBalances(env) {
+  const apiKey = env.BINANCE_API_KEY;
+  const apiSecret = env.BINANCE_SECRET_KEY;
+
+  if (!apiKey || !apiSecret) {
+    console.warn('[Binance] Thiếu BINANCE_API_KEY hoặc BINANCE_SECRET_KEY');
+    return { balances: {}, prices: {}, error: 'Missing credentials' };
+  }
+
+  try {
+    // Lấy thông tin tài khoản (balances)
+    const timestamp = Date.now();
+    const query = `timestamp=${timestamp}`;
+    const signature = await signHmacSha256(query, apiSecret);
+    const accountUrl = `https://api.binance.com/api/v3/account?${query}&signature=${signature}`;
+
+    const accountRes = await fetch(accountUrl, {
+      headers: { 'X-MBX-APIKEY': apiKey },
+    });
+
+    if (!accountRes.ok) {
+      const err = await accountRes.text();
+      console.error('[Binance] Lỗi lấy balances:', accountRes.status, err);
+      return { balances: {}, prices: {}, error: `HTTP ${accountRes.status}` };
+    }
+
+    const accountData = await accountRes.json();
+    const balances = {};
+
+    // Lấy balances > 0
+    accountData.balances?.forEach(bal => {
+      const free = parseFloat(bal.free) || 0;
+      const locked = parseFloat(bal.locked) || 0;
+      const total = free + locked;
+      if (total > 0) {
+        balances[bal.asset] = total;
+      }
+    });
+
+    console.log(`[Binance] Lấy ${Object.keys(balances).length} tài sản có số dư > 0`);
+
+    // Lấy giá từ Binance
+    const prices = {};
+    const tickers = Object.keys(balances);
+
+    // Fetch giá từng ticker (format: BTCUSDT)
+    const pricePromises = tickers.map(async ticker => {
+      try {
+        const symbol = `${ticker}USDT`;
+        const priceRes = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
+        if (priceRes.ok) {
+          const data = await priceRes.json();
+          prices[ticker] = parseFloat(data.price) || 0;
+        }
+      } catch (e) {
+        console.warn(`[Binance] Lỗi lấy giá ${ticker}:`, e.message);
+      }
+    });
+
+    await Promise.all(pricePromises);
+    console.log(`[Binance] Lấy giá ${Object.keys(prices).length} ticker`);
+
+    return { balances, prices, error: null };
+  } catch (e) {
+    console.error('[Binance] Lỗi:', e.message);
+    return { balances: {}, prices: {}, error: e.message };
+  }
+}
+
+// Helper: Tính HMAC-SHA256 cho Binance API signing
+async function signHmacSha256(message, secret) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return Array.from(new Uint8Array(sig))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 // ════════════════════════════════════════════════════════════
